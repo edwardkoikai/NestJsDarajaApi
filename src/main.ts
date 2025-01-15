@@ -4,7 +4,7 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Logger } from '@nestjs/common';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, {cors: true, logger: ['error', 'verbose', 'debug', 'log']});
+  const app = await NestFactory.create(AppModule, {cors: true, logger: ['error', 'verbose', 'debug', 'log', 'warn']});
   
   const config = new DocumentBuilder()
   . setTitle('Safaricom Daraja Api')
