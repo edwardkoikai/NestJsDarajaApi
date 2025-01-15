@@ -1,5 +1,5 @@
 import { Module } from "@nestjs/common";
-import { MpesaModule } from "src/mpesa/mpesa.module";
+import { MpesaModule } from "src/api/mpesa/mpesa.module";
 
 @Module({
     // import all your modules here
