@@ -80,7 +80,7 @@ export class MpesaService {
         this.mpesaConfig = {
             shortcode: '174379',
             passkey: this.configService.get<string>('PASS_KEY'),
-            callbackUrl: 'https://goose-merry-mollusk.ngrok-free.app/api/mpesa/callback',
+            callbackUrl: 'https://f136-102-167-44-224.ngrok-free.app/api/mpesa/callback',
             transactionType: 'CustomerPayBillOnline',
         };
         this.redis = this.redisService.getOrThrow();
@@ -88,39 +88,60 @@ export class MpesaService {
 
     async stkPush(dto: CreateMpesaExpressDto): Promise<any> {
         try {
+            this.logger.debug(`Starting STK push for phone: ${dto.phoneNumber}`);
             await this.validateDto(dto);
 
             const token = await this.getAuthToken();
+            this.logger.debug('Auth token generated successfully');
+
             const timestamp = this.generateTimestamp();
             const password = this.generatePassword(timestamp);
 
             const requestBody = this.createSTKPushRequest(dto, timestamp, password);
+            this.logger.debug(`STK push request body: ${JSON.stringify(requestBody)}`);
+
             const response = await this.sendSTKPushRequest(requestBody, token);
+            this.logger.debug(`STK push response: ${JSON.stringify(response.data)}`);
+
             const stkResponse = response.data as STKPushResponse;
 
-            await this.cacheInitialTransaction({
-              CheckoutRequestID: stkResponse.CheckoutRequestID,
-              MerchantRequestID: stkResponse.MerchantRequestID,
-              Amount: dto.amount,
-              PhoneNumber: dto.phoneNumber,
-              status: Status.PENDING,
-           });
+            // Log before caching
+            this.logger.debug(`Attempting to cache transaction: ${JSON.stringify({
+                CheckoutRequestID: stkResponse.CheckoutRequestID,
+                MerchantRequestID: stkResponse.MerchantRequestID,
+                Amount: dto.amount,
+                PhoneNumber: dto.phoneNumber,
+                status: Status.PENDING,
+            })}`);
 
+            await this.cacheInitialTransaction({
+                CheckoutRequestID: stkResponse.CheckoutRequestID,
+                MerchantRequestID: stkResponse.MerchantRequestID,
+                Amount: dto.amount,
+                PhoneNumber: dto.phoneNumber,
+                status: Status.PENDING,
+            });
+
+            this.logger.debug('Transaction cached successfully');
             return response.data;
         } catch (error) {
+            this.logger.error(`STK push failed: ${error.message}`);
             this.handleError(error);
         }
     }
 
     async processCallback(callbackData: any): Promise<void> {
         try {
-            this.logger.debug(`Callback data received: ${JSON.stringify(callbackData)}`);
+            this.logger.debug('=== Starting Callback Processing ===');
+            this.logger.debug(`Raw callback data: ${JSON.stringify(callbackData, null, 2)}`);
             
             const { stkCallback } = callbackData.Body;
-            const { CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } = stkCallback;
+            this.logger.debug(`STK Callback data: ${JSON.stringify(stkCallback, null, 2)}`);
     
-            this.logger.debug(`Processing callback for CheckoutRequestID: ${CheckoutRequestID}`);
+            const { CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } = stkCallback;
+            
             const cachedTransaction = await this.getCachedTransaction(CheckoutRequestID);
+            this.logger.debug(`Cached transaction data: ${JSON.stringify(cachedTransaction, null, 2)}`);
     
             if (!cachedTransaction) {
                 this.logger.error(`Transaction not found in cache for CheckoutRequestID: ${CheckoutRequestID}`);
@@ -128,6 +149,8 @@ export class MpesaService {
             }
     
             const metadata = this.extractCallbackMetadata(CallbackMetadata?.Item || []);
+            this.logger.debug(`Extracted metadata: ${JSON.stringify(metadata, null, 2)}`);
+    
             const transactionData: TransactionData = {
                 MerchantRequestID: stkCallback.MerchantRequestID,
                 CheckoutRequestID,
@@ -136,18 +159,21 @@ export class MpesaService {
                 Amount: cachedTransaction.Amount,
                 MpesaReceiptNumber: metadata.MpesaReceiptNumber || '',
                 Balance: metadata.Balance || 0,
-                TransactionDate: new Date(metadata.TransactionDate || Date.now()),
+                TransactionDate: metadata.TransactionDate,
                 PhoneNumber: cachedTransaction.PhoneNumber,
-                status: ResultCode === '0' ? Status.COMPLETED : Status.FAILED,
+                // Set status based on ResultCode (0 means success)
+                status: ResultCode === 0 ? Status.COMPLETED : Status.FAILED,
             };
     
-            this.logger.debug(`Saving transaction to database: ${JSON.stringify(transactionData)}`);
+            this.logger.debug(`Prepared transaction data: ${JSON.stringify(transactionData, null, 2)}`);
             await this.saveTransactionToDatabase(transactionData);
-    
+            
             await this.redis.del(CheckoutRequestID);
-            this.logger.debug(`Transaction processed and cache cleared for CheckoutRequestID: ${CheckoutRequestID}`);
+            this.logger.debug('=== Callback Processing Completed Successfully ===');
         } catch (error) {
-            this.logger.error(`Callback processing failed: ${error.message}`);
+            this.logger.error('=== Callback Processing Failed ===');
+            this.logger.error(`Error details: ${error.message}`);
+            this.logger.error(`Stack trace: ${error.stack}`);
             throw new HttpException('Failed to process callback', 500);
         }
     }
@@ -159,25 +185,48 @@ export class MpesaService {
     }
 
     private extractCallbackMetadata(items: any[]): Record<string, any> {
-        return items.reduce((acc, item) => ({ ...acc, [item.Name]: item.Value }), {});
+        const metadata = items.reduce((acc, item) => ({ ...acc, [item.Name]: item.Value }), {});
+        
+        // Parse the transaction date correctly
+        if (metadata.TransactionDate) {
+            const dateStr = metadata.TransactionDate.toString();
+            // Format: YYYYMMDDHHmmss
+            const year = dateStr.substring(0, 4);
+            const month = dateStr.substring(4, 6);
+            const day = dateStr.substring(6, 8);
+            const hour = dateStr.substring(8, 10);
+            const minute = dateStr.substring(10, 12);
+            const second = dateStr.substring(12, 14);
+            
+            metadata.TransactionDate = new Date(
+                `${year}-${month}-${day}T${hour}:${minute}:${second}.000Z`
+            );
+        }
+        
+        return metadata;
     }
 
-    private async saveTransactionToDatabase(transactionData: any): Promise<void> {
+    private async saveTransactionToDatabase(transactionData: TransactionData): Promise<void> {
         try {
-            const transaction = new Transaction();
-            transaction.transactionId = transactionData.MerchantRequestID;
-            transaction.amount = transactionData.Amount;
-            transaction.phoneNumber = transactionData.PhoneNumber;
-            transaction.status = transactionData.status;
-            transaction.MerchantRequestID = transactionData.MerchantRequestID;
-            transaction.CheckoutRequestID = transactionData.CheckoutRequestID;
-            transaction.resultCode = transactionData.ResultCode;
-            transaction.resultDesc = transactionData.ResultDesc;
+            const transaction = this.transactionRepository.create({
+                transactionId: transactionData.MerchantRequestID,
+                amount: transactionData.Amount,
+                phoneNumber: transactionData.PhoneNumber,
+                status: transactionData.status,
+                MerchantRequestID: transactionData.MerchantRequestID,
+                CheckoutRequestID: transactionData.CheckoutRequestID,
+                resultCode: transactionData.ResultCode.toString(),
+                resultDesc: transactionData.ResultDesc,
+                mpesaReceiptNumber: transactionData.MpesaReceiptNumber,
+                transactionDate: transactionData.TransactionDate,
+                balance: transactionData.Balance || 0
+            });
     
-            await this.transactionRepository.save(transaction);
-            this.logger.debug(`Transaction saved to database: ${transactionData.CheckoutRequestID}`);
+            const savedTransaction = await this.transactionRepository.save(transaction);
+            this.logger.debug(`Transaction saved to database with ID: ${savedTransaction.transactionId}`);
         } catch (error) {
             this.logger.error(`Database error: ${error.message}`);
+            this.logger.error(`Failed transaction data: ${JSON.stringify(transactionData, null, 2)}`);
             throw new HttpException('Failed to save transaction', 500);
         }
     }
@@ -198,7 +247,7 @@ export class MpesaService {
     private validateDto(dto: CreateMpesaExpressDto): void {
         const validations = [
             {
-                condition: !dto.phoneNum.match(/^2547\d{8}$/),
+                condition: !dto.phoneNumber.match(/^2547\d{8}$/),
                 message: 'Phone number must be in the format 2547XXXXXXXX',
             },
             {
